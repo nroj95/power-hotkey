@@ -34,6 +34,7 @@
 #Include "lib\caps-pause-client.ahk"
 #Include "power-hotkey\modules.ahk"
 #Include "power-hotkey\migration.ahk"
+#Include "power-hotkey\fkey-preset.ahk"
 #Include "power-hotkey\keyboard.ahk"
 #Include "power-hotkey\terminal.ahk"
 #Include "power-hotkey\utilities.ahk"
@@ -107,7 +108,8 @@ class PowerHotkeys {
         ; Legacy default triggers are deliberately NOT registered as new defaults.
         ; An action without an assignment stays visible but installs no hotkey.
         this.manager.AddAction(actionId, label, ObjBindMethod(this, "Dispatch"),
-            [], {category: PH_Modules.Label(this.modules, moduleId), enabled: true})
+            [], {category: PH_Modules.Label(this.modules, moduleId), enabled: true,
+                trackEdits: moduleId = "function-keys"})
     }
 
     Start(openSettings := false) {
@@ -136,6 +138,9 @@ class PowerHotkeys {
         Persistent true
         this.BuildTray()
         this.UpdatePause()
+        ; Offer only after startup and migration have finished. No polling loop.
+        if PH_FKeyPreset.ShouldOffer(this.manager, PH_FKeyPreset.LayerAvailable())
+            SetTimer(ObjBindMethod(this, "OfferClassicFKeys"), -1)
         if IsObject(plan) || openSettings
             this.manager.ShowSettings()
     }
@@ -336,6 +341,7 @@ class PowerHotkeys {
         A_IconTip := this.name
         A_TrayMenu.Delete()
         A_TrayMenu.Add("Keybindings", ObjBindMethod(this, "OpenKeybindings"))
+        A_TrayMenu.Add("Classic F13-F24 layout...", ObjBindMethod(this, "ApplyClassicFKeysManually"))
         A_TrayMenu.Add("Status", (*) => PH_Modules.ShowStatus(this))
         A_TrayMenu.Add()
         A_TrayMenu.Add("Run at startup", ObjBindMethod(this, "ToggleStartup"))
@@ -347,7 +353,56 @@ class PowerHotkeys {
 
     OpenKeybindings(*) {
         this.CancelWork()
+        if !IsObject(this.manager.settings)
+            this.OfferClassicFKeys()
         this.manager.ShowSettings()
+    }
+
+    OfferClassicFKeys(*) {
+        if this.stopping || !PH_FKeyPreset.ShouldOffer(this.manager, PH_FKeyPreset.LayerAvailable())
+            return
+        answer := MsgBox("Caps + Pause Layers is available, and none of your F13-F24 shortcuts has been configured."
+            . "`n`nApply Caps + QWER / ASDF / ZXCV as the twelve classic shortcuts?"
+            . "`n`nNo keeps them unassigned and prevents future automatic offers.",
+            this.name " - optional F-key layout", "YesNo Default2 Icon?")
+        if answer != "Yes" {
+            try PH_FKeyPreset.SetStatus(this.manager, "declined")
+            catch Error as statusError
+                MsgBox(statusError.Message, this.name " - could not save choice", "Icon!")
+            return
+        }
+        try {
+            ; Recheck edit history and layer availability after user confirmation.
+            PH_FKeyPreset.Apply(this.manager, false)
+            if IsObject(this.manager.settings)
+                this.manager._RefreshParticipants()
+        }
+        catch Error as presetError {
+            ; Don't repeatedly prompt after a failed automatic attempt.
+            try PH_FKeyPreset.SetStatus(this.manager, "deferred")
+            MsgBox("The classic layout was not applied. No partial assignments were saved."
+                . "`n`n" presetError.Message, this.name " - preset unavailable", "Icon!")
+        }
+    }
+
+    ApplyClassicFKeysManually(*) {
+        if !PH_FKeyPreset.LayerAvailable() {
+            MsgBox("Start Caps + Pause Layers before applying the classic layout.", this.name, "Icon!")
+            return
+        }
+        if MsgBox("Replace the primary shortcuts for all twelve F13-F24 actions with"
+            . " Caps + QWER / ASDF / ZXCV?"
+            . "`n`nSecondary shortcuts will be kept. Existing assignments might conflict.",
+            this.name " - apply classic layout", "YesNo Default2 Icon?") != "Yes"
+            return
+        try {
+            PH_FKeyPreset.Apply(this.manager, true)
+            if IsObject(this.manager.settings)
+                this.manager._RefreshParticipants()
+        }
+        catch Error as manualPresetError
+            MsgBox("The preset could not be applied. Existing shortcuts were retained."
+                . "`n`n" manualPresetError.Message, this.name " - preset rejected", "Icon!")
     }
 
     ToggleStartup(*) {
@@ -383,6 +438,10 @@ class PowerHotkeys {
         if this.log.Length > 100
             this.log.RemoveAt(1)
         OutputDebug(this.name ": " text)
+        ; The optional service can connect after Power Hotkey starts. This is
+        ; event-driven; no background scan or controller is introduced.
+        if text = "connected to Caps + Pause Layers" && IsObject(this.manager)
+            SetTimer(ObjBindMethod(this, "OfferClassicFKeys"), -1)
     }
 
     FindLegacyLayers() {
