@@ -17,10 +17,10 @@ $dependencies = @(
     @{
         Name = 'Keybindings'
         Repository = 'nroj95/keybindings'
-        Commit = '3019439fed758c9472f6c134033028483ccad20b'
+        Commit = 'f22a266abcde161c5a989b37876f803586d9b53a'
         Source = 'lib/keybindings.ahk'
         Target = 'lib/keybindings.ahk'
-        Sha256 = 'acaa6d1cee6cda3f8ee638efb78b4f367960764869a713d70d72fe9139f5cf80'
+        Sha256 = '6ab4ac48e7a309daf2e3a950e3d17b330258112414a9e024a2593c7912583c24'
     }
     @{
         Name = 'Caps + Pause client'
