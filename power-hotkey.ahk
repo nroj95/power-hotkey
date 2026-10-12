@@ -4,11 +4,12 @@
 
 ; =============================================================================
 ; power-hotkey.ahk - optional utilities using the shared keybinding manager
-; version: 0.1.0-preview.1 | AutoHotkey v2 / Windows
+; version: 0.1.0-preview.2 | AutoHotkey v2 / Windows
 ; =============================================================================
 ; purpose
 ;   Migrate the general-purpose actions from CapsLock Layer and Pause Command
-;   Mode. All feature modules start OFF. This script does not own either layer
+;   Mode. Shortcuts are configured directly; unbound actions register no hotkeys.
+;   This script does not own either layer
 ;   key, start the layer service, or implement Window Cascade commands.
 ;
 ; structure
@@ -26,12 +27,13 @@
 ; command line
 ;   --check    Parse only; no GUI, settings, hooks, audio, text or power actions.
 ;   --dry-run  Use a separate settings owner and log effects instead of executing.
-;   --settings Open the module selector even when this is not the first launch.
+;   --settings Open the shared Keybindings window.
 ; =============================================================================
 
 #Include "lib\keybindings.ahk"
 #Include "lib\caps-pause-client.ahk"
 #Include "power-hotkey\modules.ahk"
+#Include "power-hotkey\migration.ahk"
 #Include "power-hotkey\keyboard.ahk"
 #Include "power-hotkey\terminal.ahk"
 #Include "power-hotkey\utilities.ahk"
@@ -64,7 +66,7 @@ PH_Main() {
 }
 
 class PowerHotkeys {
-    static Version := "0.1.0-preview.1"
+    static Version := "0.1.0-preview.2"
 
     __New(options := {}) {
         this.dryRun := !!Keybindings.Option(options, "dryRun", false)
@@ -102,8 +104,10 @@ class PowerHotkeys {
     AddAction(moduleId, actionId, label, kind, value, defaultBinding, needsFocus := false) {
         this.catalog[actionId] := {id: actionId, moduleId: moduleId, kind: kind,
             value: value, needsFocus: needsFocus}
+        ; Legacy default triggers are deliberately NOT registered as new defaults.
+        ; An action without an assignment stays visible but installs no hotkey.
         this.manager.AddAction(actionId, label, ObjBindMethod(this, "Dispatch"),
-            [defaultBinding], {category: PH_Modules.Label(this.modules, moduleId), enabled: false})
+            [], {category: PH_Modules.Label(this.modules, moduleId), enabled: true})
     }
 
     Start(openSettings := false) {
@@ -112,10 +116,18 @@ class PowerHotkeys {
             throw Error("Close Window Cascade first, then the old CapsLock and Pause scripts."
                 . "`nDo not run the old layer scripts alongside their replacements."
                 . "`n`nDetected: " legacy "`n`nNo script was stopped automatically.")
-        ; Load saved module choices before allowing any of their hotkeys to fire.
+        ; Validate and archive existing settings before the first migration.
+        ; Keep all inputs paused until the converted configuration is committed.
+        source := FileExist(this.manager.path) ? KB_Manifest.Read(this.manager.path) : Map()
+        current := PH_Migration.IsAssignmentLayout(source)
+        plan := current ? 0 : PH_Migration.Plan(this.manager, source)
+        if source.Count && !current
+            PH_Migration.BackupLegacy(this.manager)
         this.manager.SetPaused(true)
         InstallKeybdHook(true)
         this.manager.Start()
+        if IsObject(plan)
+            PH_Migration.Install(this.manager, plan)
         this.SyncEnabledActions()
         OnExit(this.exitCallback)
         OnMessage(0x0218, this.powerCallback) ; WM_POWERBROADCAST
@@ -123,10 +135,9 @@ class PowerHotkeys {
         A_MenuMaskKey := "vkE8"
         Persistent true
         this.BuildTray()
-        if this.manager.firstRun || openSettings
-            PH_Modules.Show(this)
-        else
-            this.UpdatePause()
+        this.UpdatePause()
+        if IsObject(plan) || openSettings
+            this.manager.ShowSettings()
     }
 
     Stop(*) {
@@ -157,7 +168,7 @@ class PowerHotkeys {
     }
 
     UpdatePause() {
-        this.manager.SetPaused(this.stopping || this.systemSuspended || IsObject(this.modulesWindow))
+        this.manager.SetPaused(this.stopping || this.systemSuspended)
     }
 
     CancelWork() {
@@ -255,7 +266,7 @@ class PowerHotkeys {
                 case "terminal-clear": this.terminal.Clear(job)
                 case "speaker-wake": this.utilities.WakeSpeakers(job)
                 case "sleep": this.utilities.SleepComputer(job)
-                case "interface": PH_Modules.Show(this)
+                case "interface": this.OpenKeybindings()
                 default: throw Error("Unknown action kind: " job.action.kind)
             }
         }
@@ -324,22 +335,19 @@ class PowerHotkeys {
     BuildTray() {
         A_IconTip := this.name
         A_TrayMenu.Delete()
-        A_TrayMenu.Add("Modules", (*) => PH_Modules.Show(this))
         A_TrayMenu.Add("Keybindings", ObjBindMethod(this, "OpenKeybindings"))
         A_TrayMenu.Add("Status", (*) => PH_Modules.ShowStatus(this))
         A_TrayMenu.Add()
         A_TrayMenu.Add("Run at startup", ObjBindMethod(this, "ToggleStartup"))
         A_TrayMenu.Add("Reload", (*) => Reload())
         A_TrayMenu.Add("Exit", (*) => ExitApp())
-        A_TrayMenu.Default := "Modules"
+        A_TrayMenu.Default := "Keybindings"
         this.UpdateStartupMenu()
     }
 
     OpenKeybindings(*) {
         this.CancelWork()
-        ; Create the library window before unpausing the module-selector gate.
         this.manager.ShowSettings()
-        PH_Modules.Close(this)
     }
 
     ToggleStartup(*) {

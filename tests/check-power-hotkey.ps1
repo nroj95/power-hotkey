@@ -40,6 +40,7 @@ if (-not (Test-Path -LiteralPath $adapterPath -PathType Leaf)) {
 
 $scriptPaths = @(
     (Join-Path $PSScriptRoot 'power-hotkey-check.ahk')
+    (Join-Path $PSScriptRoot 'migration-check.ahk')
     (Join-Path $repositoryDirectory 'power-hotkey.ahk')
 )
 foreach ($scriptPath in $scriptPaths) {

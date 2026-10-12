@@ -2,7 +2,9 @@
 
 experimental AutoHotkey v2 collection of optional utilities migrated from the old CapsLock and Pause scripts.
 
-run `power-hotkey.ahk` to configure modules and keybindings. Caps + Pause Layers is optional; ordinary hotkeys work without it.
+run `power-hotkey.ahk` and configure each action directly in the unified Keybindings window.
+Actions without shortcuts remain inactive. Caps + Pause Layers is optional;
+ordinary hotkeys work without it.
 
 ## tests
 

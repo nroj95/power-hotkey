@@ -39,63 +39,40 @@ class PH_Check {
         this.Assert(!IsObject(manager.client), "construction must not connect to the layer service")
         configuration := manager._DefaultConfiguration()
         for actionId, setting in configuration {
-            this.Assert(!setting.enabled, actionId " starts disabled")
+            this.Assert(setting.enabled, actionId " is available without enabling a module")
             this.Assert(setting.bindings.Length = 2, actionId " has two configurable slots")
+            this.Assert(setting.bindings[1] = "" && setting.bindings[2] = "",
+                actionId " has no implicit shortcut")
         }
-        expectedFunctionKeys := ["Q", "W", "E", "R", "A", "S", "D", "F", "Z", "X", "C", "V"]
-        for index, suffix in expectedFunctionKeys {
+        for index, suffix in ["Q", "W", "E", "R", "A", "S", "D", "F", "Z", "X", "C", "V"] {
             output := "F" (index + 12)
             actionId := "keyboard." StrLower(output)
-            this.Assert(app.catalog[actionId].value = output, "output " output)
-            this.Assert(configuration[actionId].bindings[1] = Keybindings.Parse("Caps + " suffix).signature,
-                "default " output)
+            this.Assert(app.catalog[actionId].value = output, "independent F-key output " output)
         }
         loop 10 {
             numpadDigit := A_Index - 1
             actionId := "keyboard.numpad" numpadDigit
-            this.Assert(app.catalog[actionId].value = "Numpad" numpadDigit, "number-pad output " numpadDigit)
-            this.Assert(configuration[actionId].bindings[1] = Keybindings.Parse("Caps + " numpadDigit).signature,
-                "number-pad binding " numpadDigit)
+            this.Assert(app.catalog[actionId].value = "Numpad" numpadDigit,
+                "independent number-pad output " numpadDigit)
         }
         this.Assert(app.catalog["text.sharp-s"].value = "ß", "sharp s preserved")
         this.Assert(app.catalog["text.en-dash"].value = "–", "en dash preserved")
         this.Assert(app.catalog["text.apostrophe"].value = "’", "curly apostrophe preserved")
-        this.Assert(app.catalog["text.nbsp"].value = "&nbsp;", "literal entity preserved, not converted to whitespace")
-        this.Assert(app.catalog["text.timestamp"].kind = "timestamp", "timestamp remains dynamic")
-        this.Assert(app.catalog["terminal.copy"].needsFocus, "copy requires its original foreground window")
-        this.Assert(app.catalog["terminal.clear"].needsFocus, "clear requires its original foreground window")
-        this.Assert(configuration["terminal.copy"].bindings[1] = Keybindings.Parse("Caps + Ctrl + C").signature,
-            "copy has a distinct binding from F23")
-        this.Assert(configuration["system.wake-speakers"].bindings[1] = Keybindings.Parse("Pause + W").signature,
-            "speaker wake has an assignable non-sequence default")
-        this.Assert(configuration["keyboard.toggle-caps"].bindings[1] = Keybindings.Parse("Caps + Shift + Space").signature,
-            "Caps Lock toggle has an assignable default")
-        this.Assert(configuration["system.sleep"].bindings[1] = Keybindings.Parse("Pause + Escape").signature,
-            "sleep retains Pause+Escape")
-        enabledConfiguration := manager._CloneConfiguration(configuration)
-        for module in app.modules {
-            PH_Modules.SetModule(enabledConfiguration, app.catalog, module.id, true)
-            state := PH_Modules.State(enabledConfiguration, app.catalog, module.id)
-            this.Assert(state.total > 0 && state.enabled = state.total, module.id " enables as one unit")
-        }
-        routes := manager._CandidateRoutes(enabledConfiguration).routes
-        this.Assert(routes.Length = 33, "all modules expose all 33 default bindings")
-        signatures := Map()
-        for route in routes {
-            this.Assert(Keybindings.ConflictingSignature(route.binding, signatures) = "",
-                "defaults must not overlap: " route.action.id)
-            signatures[route.binding.signature] := true
-        }
-        customBindings := [Keybindings.Parse("Ctrl + Alt + F8").signature,
-            Keybindings.Parse("Ctrl + Shift + F8").signature]
-        enabledConfiguration["text.sharp-s"].bindings := customBindings.Clone()
-        PH_Modules.SetModule(enabledConfiguration, app.catalog, "text", false)
-        this.Assert(!enabledConfiguration["text.sharp-s"].enabled, "module disables actions")
-        this.Assert(enabledConfiguration["text.sharp-s"].bindings[1] = customBindings[1], "disable preserves primary")
-        this.Assert(enabledConfiguration["text.sharp-s"].bindings[2] = customBindings[2], "disable preserves secondary")
-        PH_Modules.SetModule(enabledConfiguration, app.catalog, "text", true)
-        this.Assert(enabledConfiguration["text.sharp-s"].bindings[1] = customBindings[1], "reenable preserves customization")
-        this.Assert(!configuration["text.sharp-s"].enabled, "configuration copies are isolated")
+        this.Assert(app.catalog["text.nbsp"].value = "&nbsp;", "literal entity preserved")
+        this.Assert(app.catalog["text.timestamp"].kind = "timestamp", "timestamp is dynamic")
+        this.Assert(app.catalog["terminal.copy"].needsFocus, "terminal copy needs focus")
+        this.Assert(app.catalog["terminal.clear"].needsFocus, "terminal clear needs focus")
+        this.Assert(manager._CandidateRoutes(configuration).routes.Length = 0,
+            "fresh Power Hotkey installs no hotkeys")
+        draft := manager._CloneConfiguration(configuration)
+        draft["keyboard.f13"].bindings[1] := Keybindings.Parse("Ctrl + Alt + F9").signature
+        this.Assert(manager._CandidateRoutes(draft).routes.Length = 1,
+            "one configured F-key installs exactly one route")
+        this.Assert(configuration["keyboard.f13"].bindings[1] = "",
+            "configuration snapshots remain independent")
+        draft["keyboard.f14"].bindings[1] := Keybindings.Parse("Ctrl + Shift + F9").signature
+        this.Assert(manager._CandidateRoutes(draft).routes.Length = 2,
+            "F-keys are not locked to the original QWER layout")
         fence := Chr(96) Chr(96) Chr(96)
         this.Assert(PH_Terminal.FormatBuffer("hello`r`n`r`n") = fence "`nhello`n" fence,
             "Markdown copy trims trailing empty lines")

@@ -2,7 +2,7 @@
 
 ; =============================================================================
 ; keybindings.ahk - reusable, opt-in keybinding manager for AutoHotkey v2
-; version: 0.2.0-preview.5 | settings/registry schema: 1 | layer protocol: 1
+; version: 0.2.0-preview.6 | settings/registry schema: 1 | layer protocol: 1
 ; =============================================================================
 ; responsibilities
 ;   - give actions stable IDs, two editable binding slots and one saved setup.
@@ -42,7 +42,7 @@
 ; =============================================================================
 
 class Keybindings {
-    static Version := "0.2.0-preview.5"
+    static Version := "0.2.0-preview.6"
     static Current := 0
 
     __New(ownerId, displayName, options := {}) {
@@ -102,10 +102,18 @@ class Keybindings {
         this.drainCallback := ObjBindMethod(this, "_Drain")
         this.maintenanceCallback := ObjBindMethod(this, "_Maintain")
         this.noticeCallback := ObjBindMethod(this, "_Notice")
+        this.ownerControlCallback := ObjBindMethod(this, "_OwnerControl")
+        this.remoteEditCallback := ObjBindMethod(this, "_ReceiveRemoteEdit")
         this.exitCallback := ObjBindMethod(this, "Stop")
         this.message := DllCall("RegisterWindowMessageW", "str",
             "nroj.Keybindings.v1.CaptureChanged", "uint")
         if !this.message
+            throw OSError(A_LastError, "RegisterWindowMessageW")
+        ; Scoped by settings root: separate preview and real registries cannot
+        ; accidentally address each other. This channel is read-only for now.
+        this.ownerControlMessage := DllCall("RegisterWindowMessageW", "str",
+            "nroj.Keybindings.v1.OwnerControl." this.scope, "uint")
+        if !this.ownerControlMessage
             throw OSError(A_LastError, "RegisterWindowMessageW")
         Keybindings.Current := this
     }
@@ -153,6 +161,8 @@ class Keybindings {
         }
         OnExit this.exitCallback
         OnMessage(this.message, this.noticeCallback)
+        OnMessage(this.ownerControlMessage, this.ownerControlCallback)
+        OnMessage(0x004A, this.remoteEditCallback) ; WM_COPYDATA
         this.running := true
         try {
             this._Load()
@@ -192,6 +202,8 @@ class Keybindings {
         this.pressed.Clear()
         this.blocked.Clear()
         try OnMessage(this.message, this.noticeCallback, 0)
+        try OnMessage(this.ownerControlMessage, this.ownerControlCallback, 0)
+        try OnMessage(0x004A, this.remoteEditCallback, 0)
         try OnExit(this.exitCallback, 0)
         if this.registryMutex
             DllCall("CloseHandle", "ptr", this.registryMutex)
@@ -205,6 +217,340 @@ class Keybindings {
 
     ; Returns a defensive copy of the single saved configuration.
     GetConfiguration() => this._CloneConfiguration(this.configuration)
+
+    ; Read-only discovery for the future multi-script configuration window.
+    ; The owning process remains authoritative for changes.
+    DiscoverParticipants() {
+        if !this.running || this.disposed
+            throw Error("Start Keybindings before discovering participants.")
+
+        participants := [{
+            id: this.id,
+            name: this.name,
+            alive: true,
+            controlReady: true,
+            hwnd: A_ScriptHwnd,
+            pid: DllCall("GetCurrentProcessId", "uint"),
+            actions: this._LocalCatalogSnapshot()
+        }]
+
+        ; Snapshot files while holding the registry lock. Never send a window
+        ; message while holding that lock: peer operations may need it too.
+        previousCritical := this._Lock()
+        try owners := this._Owners()
+        finally this._Unlock(previousCritical)
+
+        for owner in owners {
+            ; Older clients without a catalog remain undiscoverable.
+            if !owner.alive || !owner.document.Has("catalog")
+                continue
+            actions := this._PublishedCatalogSnapshot(owner.document)
+            participants.Push({
+                id: owner.id,
+                name: owner.name,
+                alive: true,
+                controlReady: this._PeerControlReady(owner),
+                hwnd: owner.hwnd,
+                pid: owner.pid,
+                actions: actions
+            })
+        }
+
+        return participants
+    }
+
+    ; Cooperative same-user IPC, protocol v1. Return codes:
+    ;   1 updated, 2 stale, 3 conflict/rejected binding, 4 unavailable,
+    ;   5 unexpected failure, 6 already set.
+    ; Only the owner commits; an external process never writes its INI file.
+    ; v1 edits one enabled or disabled action slot, not module enablement.
+    RequestRemoteSlotEdit(participant, actionId, slot, replacement) {
+        if !this.running || this.disposed || this.applying || IsObject(this.recording)
+            throw Error("Keybindings is not ready for remote editing.")
+        if !IsObject(participant) || participant.id = this.id
+            throw ValueError("A different running owner is required.")
+        Keybindings.Id(participant.id)
+        Keybindings.Id(actionId)
+        if slot != 1 && slot != 2
+            throw ValueError("Slot must be 1 or 2.")
+
+        oldAction := 0
+        for action in participant.actions {
+            if action.id = actionId {
+                oldAction := action
+                break
+            }
+        }
+        if !IsObject(oldAction)
+            throw ValueError("Action was not found in the displayed participant snapshot.")
+        proposed := Keybindings.Parse(replacement)
+        newSignature := IsObject(proposed) ? proposed.signature : ""
+        expectedSignature := oldAction.bindings[slot]
+        ; Never contact another process while holding the registry lock.
+        previousCritical := this._Lock()
+        try owners := this._Owners()
+        finally this._Unlock(previousCritical)
+        owner := 0
+        for entry in owners {
+            if entry.id = participant.id {
+                owner := entry
+                break
+            }
+        }
+        ; Do not redirect an old UI snapshot to a restarted owner process.
+        if !IsObject(owner) || !HasProp(participant, "pid")
+            || !HasProp(participant, "hwnd")
+            || owner.pid != participant.pid || owner.hwnd != participant.hwnd
+            return 4
+        if !this._PeerControlReady(owner)
+            return 4
+        ; The sender is identified by its own currently published HWND/PID.
+        ; The receiver will check the corresponding live owner manifest.
+        payload := "KBEDIT1`t" this.id "`t" owner.id "`t" actionId "`t" slot
+            . "`t" (oldAction.enabled ? "1" : "0") "`t" expectedSignature "`t" newSignature
+        if StrLen(payload) > 900
+            return 4
+        data := Buffer(StrPut(payload, "UTF-16") * 2, 0)
+        written := StrPut(payload, data, "UTF-16")
+        copyData := Buffer(A_PtrSize * 3, 0)
+        NumPut("UPtr", 0x4B425731, copyData, 0) ; KBW1
+        NumPut("UInt", written * 2, copyData, A_PtrSize)
+        NumPut("Ptr", data.Ptr, copyData, A_PtrSize * 2)
+        response := 0
+        delivered := DllCall("SendMessageTimeoutW", "ptr", owner.hwnd,
+            "uint", 0x004A, "ptr", A_ScriptHwnd, "ptr", copyData.Ptr,
+            "uint", 0x23, "uint", 1500, "ptr*", &response, "ptr")
+        ; A timeout is ambiguous: the owner might still complete the edit.
+        ; Do NOT retry automatically; refresh the participants first.
+        if !delivered
+            return 4
+        return response >= 1 && response <= 6 ? response : 5
+    }
+
+    _ReceiveRemoteEdit(senderHwnd, lParam, messageId, receiverHwnd) {
+        if receiverHwnd != A_ScriptHwnd || messageId != 0x004A
+            return
+        if !this.running || this.disposed || this.applying || IsObject(this.recording)
+            return 4
+        if !lParam || NumGet(lParam, 0, "UPtr") != 0x4B425731
+            return
+        byteCount := NumGet(lParam, A_PtrSize, "UInt")
+        textPtr := NumGet(lParam, A_PtrSize * 2, "Ptr")
+        if byteCount < 2 || byteCount > 2048 || Mod(byteCount, 2) || !textPtr
+            return 4
+        try {
+            payload := StrGet(textPtr, byteCount // 2, "UTF-16")
+            fields := StrSplit(payload, "`t")
+            if fields.Length != 8 || fields[1] != "KBEDIT1" || fields[3] != this.id
+                return 4
+            Keybindings.Id(fields[2])
+            Keybindings.Id(fields[4])
+            if fields[5] != "1" && fields[5] != "2"
+                return 4
+            if fields[6] != "0" && fields[6] != "1"
+                return 4
+            ; The registry owner identity and the sender window PID must match.
+            ; An arbitrary HWND or a stale/reused process window is rejected.
+            if !this._RemoteEditSenderValid(senderHwnd, fields[2])
+                return 4
+            return this._ApplyRemoteSlotCAS(fields[4], Integer(fields[5]),
+                fields[6] = "1", fields[7], fields[8])
+        }
+        catch Error as remoteError {
+            this._Report("remote edit rejected: " remoteError.Message)
+            return 5
+        }
+    }
+
+    _RemoteEditSenderValid(senderHwnd, senderId) {
+        if !senderHwnd || senderId = this.id
+            return false
+        processPid := 0
+        if !DllCall("GetWindowThreadProcessId", "ptr", senderHwnd,
+            "uint*", &processPid, "uint") || !processPid
+            return false
+        previousCritical := this._Lock()
+        try owners := this._Owners()
+        finally this._Unlock(previousCritical)
+        for owner in owners
+            if owner.id = senderId && owner.alive
+                && owner.hwnd = senderHwnd && owner.pid = processPid
+                return true
+        return false
+    }
+
+    ; Expected current slot and enabled state form a compare-and-swap guard.
+    ; Edit the current live configuration (not a stale whole-file snapshot).
+    _ApplyRemoteSlotCAS(actionId, slot, expectedEnabled, expectedSignature, replacement) {
+        if !this.running || this.disposed || this.applying
+            return 4
+        if !this.actions.Has(actionId) || (slot != 1 && slot != 2)
+            return 4
+        try {
+            ; Malformed input is an invalid request, not an internal failure.
+            try {
+                previous := Keybindings.Parse(expectedSignature)
+                proposed := Keybindings.Parse(replacement)
+            }
+            catch Error {
+                return 4
+            }
+            previousValue := IsObject(previous) ? previous.signature : ""
+            proposedValue := IsObject(proposed) ? proposed.signature : ""
+            if previousValue != expectedSignature || proposedValue != replacement
+                return 4
+            current := this.configuration[actionId]
+            if current.enabled != expectedEnabled || current.bindings[slot] != expectedSignature
+                return 2
+            if expectedSignature = replacement
+                return 6
+            updated := this.GetConfiguration()
+            updated[actionId].bindings[slot] := replacement
+            ; Saved-conflict approval is deliberately unsupported over IPC.
+            ; The owner must reject it instead of silently overriding a warning.
+            try this.Apply(updated)
+            catch KB_SavedConflict as savedConflict {
+                this._Report("remote edit refused: " savedConflict.Message)
+                return 3
+            }
+            catch Error as rejectedEdit {
+                this._Report("remote edit refused: " rejectedEdit.Message)
+                return 3
+            }
+            this._Report("keybinding changes saved")
+            if IsObject(this.settings)
+                this._RenderSettings()
+            return 1
+        }
+        catch Error as unexpectedError {
+            this._Report("remote edit error: " unexpectedError.Message)
+            return 5
+        }
+    }
+    ; Protocol v1, operation 1: a read-only capability handshake. No settings
+    ; are read/written and no user callbacks run in this message handler.
+    _OwnerControl(operation, challenge, messageId, receiverHwnd) {
+        if receiverHwnd != A_ScriptHwnd || messageId != this.ownerControlMessage
+            || operation != 1 || !this.running || this.disposed
+            || challenge < 1 || challenge > 0x7FFFFFFF
+            return 0
+        return challenge ^ 0x4B425031
+    }
+
+    ; Check a manifest's HWND/PID before contacting it. Fail closed for an old
+    ; process, a recycled HWND, a timed-out process, or a non-cooperating owner.
+    ; This probe is not an authorization token for future write requests.
+    _PeerControlReady(owner) {
+        if !owner.alive || !owner.hwnd || !owner.pid
+            return false
+        peerPid := 0
+        if !DllCall("GetWindowThreadProcessId", "ptr", owner.hwnd,
+            "uint*", &peerPid, "uint") || peerPid != owner.pid
+            return false
+        challenge := Random(1, 0x7FFFFFFF)
+        response := 0
+        delivered := DllCall("SendMessageTimeoutW", "ptr", owner.hwnd,
+            "uint", this.ownerControlMessage, "uptr", 1, "ptr", challenge,
+            "uint", 0x23, "uint", 350, "ptr*", &response, "ptr")
+        return !!delivered && response = (challenge ^ 0x4B425031)
+    }
+    ; Treat each category of a multi-category script as a full heading in the
+    ; unified list. Single-category scripts retain their original script heading.
+    ; Each row still carries the owning script ID for editing and conflict checks.
+    static DisplayRows(participants, search := "") {
+        rows := []
+        search := StrLower(Trim(search))
+        for participant in participants {
+            grouped := Map()
+            categoryOrder := []
+            allCategories := Map()
+            for action in participant.actions {
+                ; Module enablement belongs to the owning script.
+                if !action.enabled
+                    continue
+                allCategories[action.category] := true
+                searchable := participant.name " " action.id " " action.category " " action.label
+                for encoded in action.bindings {
+                    parsed := Keybindings.Parse(encoded)
+                    if IsObject(parsed)
+                        searchable .= " " parsed.label
+                }
+                if search != "" && !InStr(StrLower(searchable), search)
+                    continue
+                if !grouped.Has(action.category) {
+                    grouped[action.category] := []
+                    categoryOrder.Push(action.category)
+                }
+                grouped[action.category].Push({id: action.id, label: action.label,
+                    ownerId: participant.id, setting: action,
+                    editable: (participant.id = participants[1].id || participant.controlReady)})
+            }
+            if !categoryOrder.Length
+                continue
+            for category in categoryOrder {
+                heading := allCategories.Count > 1 ? category : participant.name
+                if participant.id != participants[1].id && !participant.controlReady
+                    heading .= " (view only)"
+                rows.Push({id: "", kind: "owner", label: heading,
+                    ownerId: participant.id})
+                for entry in grouped[category]
+                    rows.Push(entry)
+            }
+        }
+        return rows
+    }
+    _LocalCatalogSnapshot() {
+        result := []
+        for actionId, action in this.actions {
+            setting := this.configuration[actionId]
+            result.Push({
+                id: actionId,
+                label: action.label,
+                category: action.category,
+                enabled: setting.enabled,
+                bindings: setting.bindings.Clone()
+            })
+        }
+        return result
+    }
+
+    _PublishedCatalogSnapshot(document) {
+        if !document.Has("bindings")
+            throw Error("Participant catalog has no bindings section.")
+
+        catalog := document["catalog"]
+        savedBindings := document["bindings"]
+        if catalog.Count > 128
+            throw Error("Participant catalog exceeds the action limit.")
+
+        result := []
+        for actionId, metadata in catalog {
+            Keybindings.Id(actionId)
+            fields := StrSplit(metadata, "`t")
+            if fields.Length != 2
+                throw Error("Invalid participant action metadata.")
+
+            Keybindings.Text(fields[1], 80)
+            Keybindings.Text(fields[2], 120)
+
+            if !savedBindings.Has(actionId)
+                throw Error("Participant action has no saved configuration: " actionId)
+
+            values := StrSplit(savedBindings[actionId], "`t")
+            if values.Length != 3 || (values[1] != "0" && values[1] != "1")
+                throw Error("Invalid participant binding configuration.")
+
+            slots := this._NormalizeSlots([values[2], values[3]])
+            result.Push({
+                id: actionId,
+                label: fields[2],
+                category: fields[1],
+                enabled: values[1] = "1",
+                bindings: slots
+            })
+        }
+        return result
+    }
 
     Apply(configuration, acceptSavedConflicts := false) {
         if !this.running || this.disposed
@@ -288,6 +634,9 @@ class Keybindings {
             }
         }
         key := Keybindings._BaseKey(keyName)
+        ; An accidental global click binding could make Windows unusable.
+        if key.mouse && (key.code = "LButton" || key.code = "RButton")
+            throw ValueError("Left and right mouse buttons cannot be assigned as shortcuts.")
         if layer != "normal" && key.mouse
             throw ValueError("Layer protocol 1 supports keyboard suffixes only. Use an ordinary mouse binding.")
         if (mask = 3 && key.vk = 0x2E) || ((mask & 8) && key.vk = 0x4C)
@@ -300,6 +649,15 @@ class Keybindings {
             wheel: key.wheel, label: prefix key.label,
             signature: layer "|" mask "|" StrLower(key.code)}
     }
+
+    ; Bare middle-button and wheel shortcuts are allowed only after a GUI
+    ; confirmation. Preserve compatibility with deliberate saved bindings.
+    static NeedsMouseConfirmation(binding) {
+        return IsObject(binding) && binding.mouse && binding.modifiers = 0
+            && (binding.key = "MButton" || binding.wheel)
+    }
+
+    static _MouseCaptureCancels(mouseName) => mouseName = "LButton" || mouseName = "RButton"
 
     static _BaseKey(name) {
         if name = "" || StrLen(name) > 32 || RegExMatch(name, "[\s{}&~*$<>!^#+|]")
@@ -635,6 +993,10 @@ class Keybindings {
         for actionId, setting in configuration
             document["bindings"][actionId] := (setting.enabled ? "1" : "0")
                 . "`t" setting.bindings[1] "`t" setting.bindings[2]
+        ; Publish action metadata for future unified configuration views.
+        document["catalog"] := Map()
+        for actionId, action in this.actions
+            document["catalog"][actionId] := action.category "`t" action.label
         ; Retire the old profile sections on first successful save.
         for sectionName in ["profile:standalone", "profile:layered", "profile:default"]
             if document.Has(sectionName)
@@ -985,16 +1347,10 @@ class Keybindings {
             return
         }
 
-        ; Keep small module lists compact, while allowing a longer scrollable list.
-        categories := Map()
-        enabledActions := 0
-        for actionId, action in this.actions {
-            if !this.configuration[actionId].enabled
-                continue
-            enabledActions += 1
-            categories[action.category] := true
-        }
-        rowCount := Min(11, Max(4, enabledActions + categories.Count))
+        ; The combined list is grouped by script, while keeping the original
+        ; fixed footer, search box, native scrollbar and compact dimensions.
+        this.participants := this.DiscoverParticipants()
+        rowCount := Min(11, Max(4, Keybindings.DisplayRows(this.participants).Length))
         rowStartY := 48
         ; The scrollable rows end before the pinned bottom action bar.
         footerDividerY := rowStartY + rowCount * 35 + 8
@@ -1011,6 +1367,8 @@ class Keybindings {
         DllCall("SendMessageW", "ptr", searchBox.Hwnd, "uint", 0x1501,
             "uptr", 1, "str", "search...", "ptr")
         searchBox.OnEvent("Change", ObjBindMethod(this, "_SearchChanged"))
+        window.AddButton("x698 y12 w88 h28", "refresh").OnEvent("Click",
+            ObjBindMethod(this, "_RefreshParticipants"))
 
         this.visibleRows := []
         loop rowCount {
@@ -1033,7 +1391,7 @@ class Keybindings {
             " w24 h" (rowCount * 35) " +0x1") ; SBS_VERT
         ; Only the binding rows scroll. This separator and centered actions stay put.
         window.AddText("x22 y" footerDividerY " w752 h2 +0x10", "")
-        window.AddButton("x268 y" footerY " w140 h31", "reset all").OnEvent("Click",
+        window.AddButton("x268 y" footerY " w140 h31", "reset mine").OnEvent("Click",
             ObjBindMethod(this, "_ResetAll"))
         window.AddButton("x422 y" footerY " w130 h31", "done").OnEvent("Click",
             ObjBindMethod(this, "_RequestCloseSettings"))
@@ -1054,6 +1412,18 @@ class Keybindings {
         this.scrollPosition := 0
         this.wheelRemainder := 0
         this._RenderSettings()
+    }
+
+    _RefreshParticipants(*) {
+        if !IsObject(this.settings) || IsObject(this.recording)
+            return
+        try {
+            updated := this.DiscoverParticipants()
+            this.participants := updated
+            this._RenderSettings()
+        }
+        catch Error as participantRefreshError
+            MsgBox(participantRefreshError.Message, this.name " - could not refresh", "Icon!")
     }
 
     _WheelSettings(wParam, lParam, messageId, receiverHwnd) {
@@ -1122,34 +1492,10 @@ class Keybindings {
     _RenderSettings(*) {
         if !IsObject(this.settings)
             return
-        search := StrLower(Trim(this.settings["search"].Value))
-        categories := Map()
-        orderedCategories := []
-        for actionId, action in this.actions {
-            setting := this.configuration[actionId]
-            ; Enabled is owned by the supplying module, not this screen.
-            if !setting.enabled
-                continue
-            searchable := action.id " " action.category " " action.label
-            for encoded in setting.bindings {
-                parsed := Keybindings.Parse(encoded)
-                if IsObject(parsed)
-                    searchable .= " " parsed.label
-            }
-            if search != "" && !InStr(StrLower(searchable), search)
-                continue
-            if !categories.Has(action.category) {
-                categories[action.category] := []
-                orderedCategories.Push(action.category)
-            }
-            categories[action.category].Push(actionId)
-        }
-        this.rows := []
-        for categoryName in orderedCategories {
-            this.rows.Push({id: "", label: categoryName})
-            for actionId in categories[categoryName]
-                this.rows.Push({id: actionId, label: this.actions[actionId].label})
-        }
+        search := this.settings["search"].Value
+        ; Local changes appear immediately; remote snapshots refresh explicitly.
+        this.participants[1].actions := this._LocalCatalogSnapshot()
+        this.rows := Keybindings.DisplayRows(this.participants, search)
         maximum := Max(0, this.rows.Length - this.visibleRows.Length)
         this.scrollPosition := Min(Max(this.scrollPosition, 0), maximum)
         this.settingsScroll.Visible := maximum > 0
@@ -1168,28 +1514,35 @@ class Keybindings {
             position := this.scrollPosition + index
             visible := position <= this.rows.Length
             entry := visible ? this.rows[position] : 0
-            row.actionId := visible ? entry.id : ""
-            row.title.Visible := visible && entry.id != ""
-            row.categoryTitle.Visible := visible && entry.id = ""
-            row.primary.Visible := visible && entry.id != ""
-            row.secondary.Visible := visible && entry.id != ""
-            row.reset.Visible := visible && entry.id != ""
+            isAction := visible && entry.id != ""
+            isLocal := isAction && entry.ownerId = this.id
+            editable := isAction && entry.editable
+            row.actionId := editable ? entry.id : ""
+            row.ownerId := isAction ? entry.ownerId : ""
+            row.title.Visible := isAction
+            row.categoryTitle.Visible := visible && !isAction
+            row.primary.Visible := isAction
+            row.secondary.Visible := isAction
+            row.reset.Visible := isLocal
             if !visible
                 continue
-            if entry.id = "" {
+            if !isAction {
                 row.categoryTitle.Text := entry.label
                 continue
             }
             row.title.Text := entry.label
-            setting := this.configuration[entry.id]
+            row.primary.Enabled := editable
+            row.secondary.Enabled := editable
+            setting := isLocal ? this.configuration[entry.id] : entry.setting
             for slot, control in [row.primary, row.secondary] {
                 parsed := Keybindings.Parse(setting.bindings[slot])
                 control.Text := IsObject(parsed) ? parsed.label : "+ add"
             }
-            ; A reset button has no purpose when both bindings match defaults.
-            defaults := this.actions[entry.id].defaults
-            row.reset.Enabled := setting.bindings[1] != defaults[1]
-                || setting.bindings[2] != defaults[2]
+            if isLocal {
+                defaults := this.actions[entry.id].defaults
+                row.reset.Enabled := setting.bindings[1] != defaults[1]
+                    || setting.bindings[2] != defaults[2]
+            }
         }
     }
 
@@ -1205,7 +1558,7 @@ class Keybindings {
     }
 
     _ResetAll(*) {
-        if MsgBox("Reset all visible modules' bindings to defaults?",
+        if MsgBox("Reset all enabled shortcuts for " this.name " to defaults?",
             this.name, "YesNo Icon?") != "Yes"
             return
         configuration := this.GetConfiguration()
@@ -1256,6 +1609,7 @@ class Keybindings {
         if IsObject(this.settings)
             this.settings.Destroy()
         this.settings := 0
+        this.participants := []
         this._RefreshGate()
     }
 
@@ -1269,6 +1623,17 @@ class Keybindings {
         actionId := this.visibleRows[index].actionId
         if actionId = ""
             return
+        remoteParticipantSnapshot := 0
+        if this.visibleRows[index].ownerId != this.id {
+            for participantEntry in this.participants {
+                if participantEntry.id = this.visibleRows[index].ownerId {
+                    remoteParticipantSnapshot := participantEntry
+                    break
+                }
+            }
+            if !IsObject(remoteParticipantSnapshot) || !remoteParticipantSnapshot.controlReady
+                return
+        }
         captureMutex := DllCall("CreateMutexW", "ptr", 0, "int", false,
             "str", this.mutexPrefix ".Capture", "ptr")
         mutexError := A_LastError
@@ -1280,6 +1645,7 @@ class Keybindings {
         }
         record := {mutex: captureMutex, window: 0, hook: 0, peers: [],
             pending: "", pendingKey: "", clearing: false, actionId: actionId, slot: slot,
+            participant: remoteParticipantSnapshot,
             finish: ObjBindMethod(this, "_FinishRecordedKey"),
             timeout: ObjBindMethod(this, "_RecordingTimedOut")}
         this.recording := record
@@ -1356,6 +1722,12 @@ class Keybindings {
     _RecordMouse(mouseName, *) {
         if !IsObject(this.recording)
             return
+        ; Either primary mouse button is a safe, no-save cancel gesture.
+        ; Handle it before the focus check so clicking outside also cancels.
+        if Keybindings._MouseCaptureCancels(mouseName) {
+            this._EndRecording()
+            return
+        }
         if !WinActive("ahk_id " this.settings.Hwnd) {
             this._EndRecording()
             return
@@ -1398,7 +1770,40 @@ class Keybindings {
         value := record.clearing ? "" : record.pending
         actionId := record.actionId
         slot := record.slot
+        remoteParticipantSnapshot := record.participant
+        ; Release the capture mutex before any confirmation dialog; clicking
+        ; Yes/No must work normally and must not itself become a shortcut.
         this._EndRecording()
+        if Keybindings.NeedsMouseConfirmation(Keybindings.Parse(value)) {
+            answer := MsgBox("An unmodified middle-click or mouse-wheel shortcut can interfere with normal mouse use."
+                . "`n`nAssign it anyway?", this.name " - confirm mouse shortcut",
+                "YesNo Default2 Icon!")
+            if answer != "Yes"
+                return
+        }
+        if IsObject(remoteParticipantSnapshot) {
+            try {
+                status := this.RequestRemoteSlotEdit(remoteParticipantSnapshot, actionId, slot, value)
+                if status = 1 || status = 6 {
+                    this._RefreshParticipants()
+                    return
+                }
+                switch status {
+                    case 2: message := "The shortcut changed in " remoteParticipantSnapshot.name
+                        . " since the list was refreshed. Please try again."
+                    case 3: message := "The owning script rejected this shortcut, possibly due to a conflict."
+                    case 4: message := "The owning script is no longer available or did not respond."
+                    default: message := "The owning script could not complete the edit (code " status ")."
+                }
+                this._RefreshParticipants()
+                MsgBox(message, this.name " - shortcut not changed", "Icon!")
+            }
+            catch Error as remoteCaptureEditError {
+                this._RefreshParticipants()
+                MsgBox(remoteCaptureEditError.Message, this.name " - remote edit failed", "Icon!")
+            }
+            return
+        }
         configuration := this.GetConfiguration()
         configuration[actionId].bindings[slot] := value
         this._SaveConfiguration(configuration)

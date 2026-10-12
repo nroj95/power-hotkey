@@ -1,30 +1,28 @@
 ; =============================================================================
-; modules.ahk - feature catalog and the module-selection interface
+; modules.ahk - feature categories, action registrations, and status window
 ; =============================================================================
-; Module toggles are saved in the keybinding manager's existing enabled fields.
-; There is no second settings file to drift out of sync with those fields.
-; Disabling a module removes its active bindings but retains both saved slots.
-; The keybinding dialog itself remains the shared library's responsibility.
+; All actions are assignable in the shared Keybindings interface. No separate
+; module selector is needed; unbound actions install no hotkeys.
 ; =============================================================================
 
 class PH_Modules {
     static Catalog() {
         return [
-            {id: "function-keys", label: "extra function keys",
-                description: "F13-F24 through the original Q/W/E/R, A/S/D/F, Z/X/C/V positions."},
-            {id: "number-pad", label: "virtual number pad",
+            {id: "function-keys", label: "Extra function keys",
+                description: "F13-F24 outputs can be assigned to any supported shortcut."},
+            {id: "number-pad", label: "Virtual number pad",
                 description: "Numpad 0-9 through the number row, with held-key release handling."},
-            {id: "terminal", label: "Windows Terminal tools",
+            {id: "terminal", label: "Windows Terminal",
                 description: "Copy the buffer as Markdown, or clear it. Only acts in Windows Terminal."},
-            {id: "text", label: "text snippets",
+            {id: "text", label: "Text and symbols",
                 description: "Insert ß, an en dash, a curly apostrophe, or the literal text &nbsp;."},
-            {id: "timestamp", label: "timestamps",
+            {id: "timestamp", label: "Timestamps",
                 description: "Insert the current local time as yyyyMMdd-HHmmss."},
             {id: "caps-lock", label: "Caps Lock toggle",
                 description: "Toggle actual capitalization using a configurable shortcut."},
-            {id: "speaker-wake", label: "speaker wake",
+            {id: "speaker-wake", label: "Speaker wake",
                 description: "Play the original Windows sound; temporarily raise low volume to 16%."},
-            {id: "sleep", label: "computer sleep",
+            {id: "sleep", label: "Computer sleep",
                 description: "Put Windows to sleep after the trigger keys are released. Wake events stay enabled."},
             {id: "interface", label: "Power Hotkey controls",
                 description: "Open this window from a configurable shortcut. The tray menu is always available."}
@@ -71,108 +69,6 @@ class PH_Modules {
             "interface", "", "Pause + H")
     }
 
-    static SetModule(configuration, catalog, moduleId, enabled) {
-        found := false
-        for actionId, action in catalog {
-            if action.moduleId != moduleId
-                continue
-            configuration[actionId].enabled := !!enabled
-            found := true
-        }
-        if !found
-            throw ValueError("Unknown or empty module: " moduleId)
-        return configuration
-    }
-
-    static State(configuration, catalog, moduleId) {
-        enabled := 0
-        total := 0
-        for actionId, action in catalog {
-            if action.moduleId != moduleId
-                continue
-            total += 1
-            if configuration[actionId].enabled
-                enabled += 1
-        }
-        return {enabled: enabled, total: total}
-    }
-
-    static Show(app) {
-        if app.stopping
-            return
-        if IsObject(app.manager.settings) {
-            app.manager.ShowSettings()
-            return
-        }
-        if IsObject(app.modulesWindow) {
-            app.modulesWindow.Show()
-            return
-        }
-        window := Gui("-Resize", app.name)
-        app.modulesWindow := window
-        app.UpdatePause()
-        app.CancelWork()
-        window.SetFont("s10", "Segoe UI")
-        window.AddText("x20 y16 w590 h34 +0x80",
-            "choose which modules to enable. disabled modules keep their saved keybindings."
-            . "`nCaps/Pause defaults need the layer service; ordinary bindings work without it.")
-        configuration := app.manager.GetConfiguration()
-        for index, module in app.modules {
-            y := 62 + (index - 1) * 55
-            state := this.State(configuration, app.catalog, module.id)
-            check := window.AddCheckbox("x20 y" y " w590 h22 Check3", module.label)
-            check.Value := state.enabled = 0 ? 0 : state.enabled = state.total ? 1 : -1
-            check.OnEvent("Click", ObjBindMethod(this, "Change", app, module.id))
-            window.AddText("x42 y" (y + 24) " w568 h28 +0x80", module.description)
-        }
-        footerY := 65 + app.modules.Length * 55
-        window.AddText("x20 y" footerY " w590 h2 +0x10", "")
-        window.AddButton("x164 y" (footerY + 14) " w145 h30", "keybindings").OnEvent(
-            "Click", ObjBindMethod(app, "OpenKeybindings"))
-        window.AddButton("x321 y" (footerY + 14) " w145 h30", "done").OnEvent(
-            "Click", ObjBindMethod(this, "Close", app))
-        window.OnEvent("Close", ObjBindMethod(this, "Close", app))
-        window.OnEvent("Escape", ObjBindMethod(this, "Close", app))
-        window.Show("w630 h" (footerY + 60))
-    }
-
-    static Change(app, moduleId, control, *) {
-        configuration := app.manager.GetConfiguration()
-        previous := this.State(configuration, app.catalog, moduleId)
-        ; The indeterminate visual state means a future/new action remains off.
-        ; Clicking the selector always chooses a consistent on/off module state.
-        enabled := previous.enabled < previous.total
-        this.SetModule(configuration, app.catalog, moduleId, enabled)
-        app.CancelWork()
-        try {
-            try app.manager.Apply(configuration)
-            catch KB_SavedConflict as savedWarning {
-                if MsgBox(savedWarning.Message "`n`nKeep these assignments anyway?",
-                    app.name, "YesNo Icon!") != "Yes" {
-                    control.Value := previous.enabled = 0 ? 0 : previous.enabled = previous.total ? 1 : -1
-                    return
-                }
-                app.manager.Apply(configuration, true)
-            }
-            app.SyncEnabledActions()
-            control.Value := enabled ? 1 : 0
-        }
-        catch Error as moduleError {
-            ; A failed binding transaction must not pretend the module was enabled.
-            app.SyncEnabledActions()
-            actual := this.State(app.manager.GetConfiguration(), app.catalog, moduleId)
-            control.Value := actual.enabled = 0 ? 0 : actual.enabled = actual.total ? 1 : -1
-            MsgBox(moduleError.Message, app.name " - module unchanged", "Icon!")
-        }
-    }
-
-    static Close(app, *) {
-        if IsObject(app.modulesWindow)
-            app.modulesWindow.Destroy()
-        app.modulesWindow := 0
-        app.UpdatePause()
-    }
-
     static ShowStatus(app, *) {
         if IsObject(app.statusWindow) {
             this.RefreshStatus(app)
@@ -199,7 +95,7 @@ class PH_Modules {
             "settings: " app.manager.path, "", "bindings"]
         statuses := app.manager.GetStatus()
         if !statuses.Length
-            lines.Push("none - enable a module first")
+            lines.Push("none - assign a shortcut first")
         for status in statuses
             lines.Push(status.label " / " status.binding ": " status.state)
         lines.Push("", "recent messages")
