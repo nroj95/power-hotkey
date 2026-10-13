@@ -81,6 +81,7 @@ class Keybindings {
         this.applying := false
         this.disposed := false
         this.settings := 0
+        this.settingsIcons := []
         this.client := 0
         this.ownerMutex := 0
         this.registryMutex := 0
@@ -1413,8 +1414,9 @@ class Keybindings {
         footerY := footerDividerY + 15
         windowHeight := footerY + 49
 
-        window := Gui("-Resize", this.name " - keybindings")
+        window := Gui("-Resize", "Keybindings")
         this.settings := window
+        this._SetSettingsIcons(window)
         this._RefreshGate()
         window.SetFont("s10", "Segoe UI")
         ; Center the search box independently of the scrollable rows.
@@ -1462,6 +1464,28 @@ class Keybindings {
         this.wheelHookActive := true
         OnMessage(0x0115, this.verticalScrollCallback)
         this.verticalScrollHookActive := true
+    }
+
+    _SetSettingsIcons(window) {
+        SplitPath(A_LineFile, , &libraryDirectory)
+        iconPath := libraryDirectory "\..\icons\keybindings.ico"
+        if !FileExist(iconPath)
+            return
+
+        for index, size in [16, 32] {
+            imageType := 0
+            iconHandle := LoadPicture(iconPath, "Icon1 w" size " h" size, &imageType)
+            if !iconHandle
+                continue
+            if imageType != 1 {
+                DllCall(imageType = 2 ? "DestroyCursor" : "DeleteObject", "ptr", iconHandle)
+                continue
+            }
+
+            this.settingsIcons.Push(iconHandle)
+            ; WM_SETICON: small caption icon, then large taskbar icon.
+            SendMessage(0x0080, index - 1, iconHandle, , window.Hwnd)
+        }
     }
 
     _SearchChanged(*) {
@@ -1668,6 +1692,9 @@ class Keybindings {
         this.wheelRemainder := 0
         if IsObject(this.settings)
             this.settings.Destroy()
+        for iconHandle in this.settingsIcons
+            DllCall("DestroyIcon", "ptr", iconHandle)
+        this.settingsIcons := []
         this.settings := 0
         this.participants := []
         this._RefreshGate()

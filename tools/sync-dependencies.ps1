@@ -17,10 +17,26 @@ $dependencies = @(
     @{
         Name = 'Keybindings'
         Repository = 'nroj95/keybindings'
-        Commit = 'f22a266abcde161c5a989b37876f803586d9b53a'
+        Commit = '42261fa924c74ccd0c5887ff3408c03cbcc6c0d0'
         Source = 'lib/keybindings.ahk'
         Target = 'lib/keybindings.ahk'
-        Sha256 = '6ab4ac48e7a309daf2e3a950e3d17b330258112414a9e024a2593c7912583c24'
+        Sha256 = 'FF7C4C5AB6C3A3355CBFBCA14FF043D492AFE01F35ABF81E636C8018E5875CB2'
+    }
+    @{
+        Name = 'Keybindings icon'
+        Repository = 'nroj95/keybindings'
+        Commit = '42261fa924c74ccd0c5887ff3408c03cbcc6c0d0'
+        Source = 'icons/keybindings.ico'
+        Target = 'icons/keybindings.ico'
+        Sha256 = 'B7AAB409F49DA17E2189EAA3E9F115AFE0A96DB197D383406E948477BFD0128F'
+    }
+    @{
+        Name = 'Keybindings attribution'
+        Repository = 'nroj95/keybindings'
+        Commit = '42261fa924c74ccd0c5887ff3408c03cbcc6c0d0'
+        Source = 'icons/ATTRIBUTION.md'
+        Target = 'icons/keybindings-ATTRIBUTION.md'
+        Sha256 = '9D3CA0A4A7AAD2977B9DB85CF582D2E439211185C6F89D07C0586EFB8146486E'
     }
     @{
         Name = 'Caps + Pause client'
